@@ -1,22 +1,747 @@
-name: Build
+name: Build APK
+
 on:
   push:
+    branches: [ main ]
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: tar xzf project.tar.gz
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Scaffold project
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/relay/app
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "MinecraftRelay"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          kotlin.code.style=official
+          org.gradle.jvmargs=-Xmx2048m
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.relay.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.relay.app"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildTypes { release { isMinifyEnabled = false } }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.compose.animation:animation")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+              <application
+                  android:label="MC Relay"
+                  android:theme="@style/Theme.Material3.Dark.NoActionBar"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources><string name="app_name">MC Relay</string></resources>
+          EOF
+
+          cat > app/src/main/java/com/relay/app/LanRelay.kt <<'EOF'
+          package com.relay.app
+
+          import kotlinx.coroutines.*
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.net.InetSocketAddress
+
+          class LanRelay(
+              private val targetHost: String,
+              private val targetPort: Int,
+              private val listenPort: Int = 19132,
+              private val onLog: (String) -> Unit
+          ) {
+              private var job: Job? = null
+              private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+              fun start() {
+                  job = scope.launch {
+                      try {
+                          val socket = DatagramSocket(null).apply {
+                              reuseAddress = true
+                              broadcast = true
+                              bind(InetSocketAddress(listenPort))
+                          }
+                          onLog("Listening on UDP :$listenPort")
+                          onLog("Forwarding to $targetHost:$targetPort")
+
+                          val buf = ByteArray(65535)
+                          val target = InetAddress.getByName(targetHost)
+                          var lastClient: InetSocketAddress? = null
+
+                          while (isActive) {
+                              val p = DatagramPacket(buf, buf.size)
+                              socket.receive(p)
+                              val from = p.socketAddress as InetSocketAddress
+                              if (from.hostString != targetHost) {
+                                  lastClient = from
+                                  socket.send(DatagramPacket(p.data, p.length, target, targetPort))
+                                  onLog("-> ${p.length}B to PS")
+                              } else {
+                                  lastClient?.let {
+                                      socket.send(DatagramPacket(p.data, p.length, it))
+                                      onLog("<- ${p.length}B from PS")
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          onLog("Error: ${e.message}")
+                      }
+                  }
+              }
+
+              fun stop() {
+                  job?.cancel()
+                  onLog("Stopped")
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/relay/app/Theme.kt <<'EOF'
+          package com.relay.app
+
+          import androidx.compose.ui.graphics.Color
+
+          object Glass {
+              val BgTop = Color(0xFF050912)
+              val BgMid = Color(0xFF0B1426)
+              val BgBottom = Color(0xFF050912)
+
+              val Accent = Color(0xFF4ADE80)
+              val Accent2 = Color(0xFF22D3EE)
+              val Danger = Color(0xFFF87171)
+
+              val GlassFill = Color(0x14FFFFFF)
+              val GlassFill2 = Color(0x0AFFFFFF)
+              val GlassBorder = Color(0x26FFFFFF)
+              val GlassBorderStrong = Color(0x40FFFFFF)
+
+              val TextPrimary = Color(0xFFF1F5F9)
+              val TextSecondary = Color(0xFF94A3B8)
+              val TextMuted = Color(0xFF475569)
+          }
+          EOF
+
+          cat > app/src/main/java/com/relay/app/MainActivity.kt <<'EOF'
+          package com.relay.app
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.animation.animateColorAsState
+          import androidx.compose.animation.core.*
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material.icons.rounded.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.scale
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme(
+                          colorScheme = darkColorScheme(
+                              primary = Glass.Accent,
+                              background = Glass.BgTop,
+                              surface = Glass.BgMid
+                          )
+                      ) {
+                          GlassBackground { RelayScreen() }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun GlassBackground(content: @Composable () -> Unit) {
+              Box(
+                  Modifier
+                      .fillMaxSize()
+                      .background(
+                          Brush.verticalGradient(
+                              listOf(Glass.BgTop, Glass.BgMid, Glass.BgBottom)
+                          )
+                      )
+              ) {
+                  // weiche Farb-Blobs als Lichtquellen
+                  Box(
+                      Modifier
+                          .size(340.dp)
+                          .offset(x = (-80).dp, y = (-60).dp)
+                          .background(
+                              Brush.radialGradient(
+                                  listOf(Glass.Accent.copy(alpha = 0.22f), Color.Transparent)
+                              ),
+                              CircleShape
+                          )
+                  )
+                  Box(
+                      Modifier
+                          .size(320.dp)
+                          .align(Alignment.BottomEnd)
+                          .offset(x = 80.dp, y = 60.dp)
+                          .background(
+                              Brush.radialGradient(
+                                  listOf(Glass.Accent2.copy(alpha = 0.20f), Color.Transparent)
+                              ),
+                              CircleShape
+                          )
+                  )
+                  content()
+              }
+          }
+
+          @Composable
+          fun GlassCard(
+              modifier: Modifier = Modifier,
+              cornerRadius: Int = 28,
+              content: @Composable ColumnScope.() -> Unit
+          ) {
+              Column(
+                  modifier = modifier
+                      .clip(RoundedCornerShape(cornerRadius.dp))
+                      .background(Glass.GlassFill)
+                      .border(
+                          1.dp,
+                          Brush.linearGradient(
+                              listOf(Glass.GlassBorderStrong, Glass.GlassBorder, Color.Transparent)
+                          ),
+                          RoundedCornerShape(cornerRadius.dp)
+                      )
+                      .padding(20.dp),
+                  content = content
+              )
+          }
+
+          @Composable
+          fun GlassTextField(
+              value: String,
+              onValueChange: (String) -> Unit,
+              label: String,
+              icon: @Composable () -> Unit,
+              keyboardType: KeyboardType = KeyboardType.Text
+          ) {
+              Column {
+                  Text(
+                      label,
+                      color = Glass.TextSecondary,
+                      fontSize = 12.sp,
+                      fontWeight = FontWeight.SemiBold,
+                      letterSpacing = 0.6.sp,
+                      modifier = Modifier.padding(start = 6.dp, bottom = 8.dp)
+                  )
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .clip(RoundedCornerShape(20.dp))
+                          .background(Glass.GlassFill2)
+                          .border(1.dp, Glass.GlassBorder, RoundedCornerShape(20.dp))
+                          .padding(horizontal = 16.dp, vertical = 4.dp),
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Box(
+                          Modifier
+                              .size(38.dp)
+                              .clip(CircleShape)
+                              .background(Glass.Accent.copy(alpha = 0.14f)),
+                          contentAlignment = Alignment.Center
+                      ) { icon() }
+                      Spacer(Modifier.width(14.dp))
+                      BasicTextFieldGlass(
+                          value = value,
+                          onValueChange = onValueChange,
+                          keyboardType = keyboardType
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun BasicTextFieldGlass(
+              value: String,
+              onValueChange: (String) -> Unit,
+              keyboardType: KeyboardType
+          ) {
+              androidx.compose.foundation.text.BasicTextField(
+                  value = value,
+                  onValueChange = onValueChange,
+                  singleLine = true,
+                  textStyle = androidx.compose.ui.text.TextStyle(
+                      color = Glass.TextPrimary,
+                      fontSize = 16.sp,
+                      fontWeight = FontWeight.Medium
+                  ),
+                  keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+                  cursorBrush = androidx.compose.ui.graphics.SolidColor(Glass.Accent),
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(vertical = 12.dp)
+              )
+          }
+
+          @Composable
+          fun RelayScreen() {
+              var ip by remember { mutableStateOf("192.168.1.") }
+              var port by remember { mutableStateOf("19132") }
+              var running by remember { mutableStateOf(false) }
+              var logs by remember { mutableStateOf(listOf<String>()) }
+              var relay by remember { mutableStateOf<LanRelay?>(null) }
+
+              val scroll = rememberScrollState()
+
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(scroll)
+                      .padding(horizontal = 20.dp)
+                      .padding(top = 48.dp, bottom = 32.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp)
+              ) {
+                  // ---- Header ----
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Box(
+                          Modifier
+                              .size(52.dp)
+                              .clip(RoundedCornerShape(16.dp))
+                              .background(
+                                  Brush.linearGradient(
+                                      listOf(Glass.Accent, Glass.Accent2)
+                                  )
+                              ),
+                          contentAlignment = Alignment.Center
+                      ) {
+                          Icon(
+                              Icons.Rounded.SportsEsports,
+                              contentDescription = null,
+                              tint = Color(0xFF050912),
+                              modifier = Modifier.size(28.dp)
+                          )
+                      }
+                      Spacer(Modifier.width(14.dp))
+                      Column {
+                          Text(
+                              "MC Relay",
+                              color = Glass.TextPrimary,
+                              fontSize = 24.sp,
+                              fontWeight = FontWeight.Black,
+                              letterSpacing = (-0.5).sp
+                          )
+                          Text(
+                              "LAN Bridge · ohne Werbung",
+                              color = Glass.TextSecondary,
+                              fontSize = 12.sp
+                          )
+                      }
+                  }
+
+                  Spacer(Modifier.height(4.dp))
+
+                  // ---- Status ----
+                  StatusPill(running)
+
+                  Spacer(Modifier.height(4.dp))
+
+                  // ---- Verbindung ----
+                  GlassCard {
+                      Text(
+                          "Verbindung",
+                          color = Glass.TextPrimary,
+                          fontSize = 15.sp,
+                          fontWeight = FontWeight.Bold
+                      )
+                      Spacer(Modifier.height(16.dp))
+                      GlassTextField(
+                          value = ip,
+                          onValueChange = { ip = it },
+                          label = "PLAYSTATION IP",
+                          icon = {
+                              Icon(
+                                  Icons.Rounded.Wifi,
+                                  null,
+                                  tint = Glass.Accent,
+                                  modifier = Modifier.size(20.dp)
+                              )
+                          },
+                          keyboardType = KeyboardType.Decimal
+                      )
+                      Spacer(Modifier.height(14.dp))
+                      GlassTextField(
+                          value = port,
+                          onValueChange = { port = it },
+                          label = "PORT",
+                          icon = {
+                              Icon(
+                                  Icons.Rounded.SettingsEthernet,
+                                  null,
+                                  tint = Glass.Accent2,
+                                  modifier = Modifier.size(20.dp)
+                              )
+                          },
+                          keyboardType = KeyboardType.Number
+                      )
+                  }
+
+                  // ---- Hauptbutton ----
+                  ConnectButton(running) {
+                      if (running) {
+                          relay?.stop(); relay = null; running = false
+                      } else {
+                          val r = LanRelay(ip.trim(), port.toIntOrNull() ?: 19132) { msg ->
+                              logs = (logs + msg).takeLast(200)
+                          }
+                          r.start(); relay = r; running = true
+                      }
+                  }
+
+                  // ---- Log ----
+                  GlassCard {
+                      Row(
+                          Modifier.fillMaxWidth(),
+                          verticalAlignment = Alignment.CenterVertically
+                      ) {
+                          Icon(
+                              Icons.Rounded.Terminal,
+                              null,
+                              tint = Glass.Accent,
+                              modifier = Modifier.size(18.dp)
+                          )
+                          Spacer(Modifier.width(10.dp))
+                          Text(
+                              "Protokoll",
+                              color = Glass.TextPrimary,
+                              fontSize = 15.sp,
+                              fontWeight = FontWeight.Bold
+                          )
+                          Spacer(Modifier.weight(1f))
+                          if (logs.isNotEmpty()) {
+                              Text(
+                                  "${logs.size}",
+                                  color = Glass.TextMuted,
+                                  fontSize = 12.sp
+                              )
+                          }
+                      }
+                      Spacer(Modifier.height(14.dp))
+                      if (logs.isEmpty()) {
+                          Column(
+                              Modifier.fillMaxWidth().padding(vertical = 20.dp),
+                              horizontalAlignment = Alignment.CenterHorizontally
+                          ) {
+                              Icon(
+                                  Icons.Rounded.CloudQueue,
+                                  null,
+                                  tint = Glass.TextMuted,
+                                  modifier = Modifier.size(32.dp)
+                              )
+                              Spacer(Modifier.height(8.dp))
+                              Text(
+                                  "Noch keine Aktivität",
+                                  color = Glass.TextMuted,
+                                  fontSize = 13.sp
+                              )
+                          }
+                      } else {
+                          Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                              logs.takeLast(20).reversed().forEach { line ->
+                                  Row(
+                                      Modifier
+                                          .fillMaxWidth()
+                                          .clip(RoundedCornerShape(10.dp))
+                                          .background(Glass.GlassFill2)
+                                          .padding(horizontal = 10.dp, vertical = 8.dp),
+                                      verticalAlignment = Alignment.CenterVertically
+                                  ) {
+                                      Box(
+                                          Modifier
+                                              .size(6.dp)
+                                              .background(
+                                                  if (line.startsWith("->"))
+                                                      Glass.Accent
+                                                  else if (line.startsWith("<-"))
+                                                      Glass.Accent2
+                                                  else Glass.TextMuted,
+                                                  CircleShape
+                                              )
+                                      )
+                                      Spacer(Modifier.width(10.dp))
+                                      Text(
+                                          line,
+                                          color = Glass.TextSecondary,
+                                          fontSize = 11.sp,
+                                          maxLines = 1
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  Spacer(Modifier.height(8.dp))
+                  Text(
+                      "Tipp: PS5 muss im selben WLAN sein. Port meist 19132.",
+                      color = Glass.TextMuted,
+                      fontSize = 11.sp,
+                      textAlign = TextAlign.Center,
+                      modifier = Modifier.fillMaxWidth()
+                  )
+              }
+          }
+
+          @Composable
+          fun StatusPill(running: Boolean) {
+              val targetColor = if (running) Glass.Accent else Glass.TextSecondary
+              val color by animateColorAsState(targetColor, label = "statusColor")
+
+              val pulse = rememberInfiniteTransition(label = "pulse")
+              val scale by pulse.animateFloat(
+                  initialValue = 1f,
+                  targetValue = if (running) 1.25f else 1f,
+                  animationSpec = infiniteRepeatable(
+                      animation = tween(900, easing = FastOutSlowInEasing),
+                      repeatMode = RepeatMode.Reverse
+                  ),
+                  label = "pulseScale"
+              )
+
+              Row(
+                  Modifier
+                      .fillMaxWidth()
+                      .clip(RoundedCornerShape(24.dp))
+                      .background(
+                          Brush.horizontalGradient(
+                              listOf(
+                                  color.copy(alpha = 0.18f),
+                                  color.copy(alpha = 0.05f)
+                              )
+                          )
+                      )
+                      .border(1.dp, color.copy(alpha = 0.35f), RoundedCornerShape(24.dp))
+                      .padding(horizontal = 18.dp, vertical = 14.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Box(
+                      Modifier
+                          .size(12.dp)
+                          .scale(if (running) scale else 1f)
+                          .background(color, CircleShape)
+                  )
+                  Spacer(Modifier.width(14.dp))
+                  Column {
+                      Text(
+                          if (running) "Verbunden" else "Getrennt",
+                          color = color,
+                          fontSize = 15.sp,
+                          fontWeight = FontWeight.Bold
+                      )
+                      Text(
+                          if (running) "Bridge aktiv auf UDP :19132"
+                          else "Bereit zum Start",
+                          color = Glass.TextSecondary,
+                          fontSize = 11.sp
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun ConnectButton(running: Boolean, onClick: () -> Unit) {
+              val c1 = if (running) Glass.Danger else Glass.Accent
+              val c2 = if (running) Color(0xFFFB923C) else Glass.Accent2
+
+              Box(
+                  Modifier
+                      .fillMaxWidth()
+                      .height(64.dp)
+                      .clip(RoundedCornerShape(22.dp))
+                      .background(Brush.horizontalGradient(listOf(c1, c2)))
+                      .border(
+                          1.dp,
+                          Color.White.copy(alpha = 0.25f),
+                          RoundedCornerShape(22.dp)
+                      )
+              ) {
+                  Row(
+                      Modifier
+                          .fillMaxSize()
+                          .padding(horizontal = 24.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.Center
+                  ) {
+                      Icon(
+                          if (running) Icons.Rounded.StopCircle
+                          else Icons.Rounded.PlayCircle,
+                          null,
+                          tint = Color(0xFF050912),
+                          modifier = Modifier.size(26.dp)
+                      )
+                      Spacer(Modifier.width(12.dp))
+                      Text(
+                          if (running) "STOPPEN" else "VERBINDEN",
+                          color = Color(0xFF050912),
+                          fontSize = 17.sp,
+                          fontWeight = FontWeight.Black,
+                          letterSpacing = 1.sp
+                      )
+                  }
+                  // Klick-Fläche
+                  Box(
+                      Modifier
+                          .fillMaxSize()
+                          .clip(RoundedCornerShape(22.dp))
+                          .background(Color.Transparent)
+                          .clickableGlass(onClick)
+                  )
+              }
+          }
+
+          fun Modifier.clickableGlass(onClick: () -> Unit): Modifier =
+              this.then(
+                  Modifier.clickableCompat(onClick)
+              )
+
+          @Composable
+          fun Modifier.clickableCompat(onClick: () -> Unit): Modifier {
+              return this.then(
+                  androidx.compose.foundation.clickable(
+                      onClick = onClick
+                  ) as Modifier
+              )
+          }
+          EOF
+
+      - name: Fix clickable import
+        run: |
+          python3 - <<'PY'
+          p = "app/src/main/java/com/relay/app/MainActivity.kt"
+          s = open(p).read()
+          s = s.replace("import androidx.compose.foundation.background",
+                        "import androidx.compose.foundation.background\nimport androidx.compose.foundation.clickable")
+          # remove the custom clickableCompat helper -> replace with direct clickable
+          s = s.replace("""
+          fun Modifier.clickableGlass(onClick: () -> Unit): Modifier =
+              this.then(
+                  Modifier.clickableCompat(onClick)
+              )
+
+          @Composable
+          fun Modifier.clickableCompat(onClick: () -> Unit): Modifier {
+              return this.then(
+                  androidx.compose.foundation.clickable(
+                      onClick = onClick
+                  ) as Modifier
+              )
+          }
+          """, """
+          fun Modifier.clickableGlass(onClick: () -> Unit): Modifier =
+              this.clickable { onClick() }
+          """)
+          open(p, "w").write(s)
+          PY
+
+      - name: Build
+        run: |
+          gradle wrapper --gradle-version 8.7
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
-          gradle-version: 8.9
-      - run: gradle assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
-        with:
-          name: LanRelay
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: minecraft-relay-apk
+          path: app/build/outputs/apk/debug/*.apk
